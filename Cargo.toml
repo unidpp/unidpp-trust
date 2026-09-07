@@ -1,0 +1,22 @@
+[package]
+name = "unidpp-trust"
+description = "UniDPP trust-list service: jurisdiction trust lists per framework, M-of-K multi-witness master list, live reason→retroactivity revocations, signed JSON responses (multi-suite co-signed, tree-head domain), append-only JSONL journal with restart replay, seed fixtures derived from unidpp-signatif's test trust graph so verdict verifiers can fetch live state"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/unidpp/unidpp-trust"
+rust-version = "1.75"
+
+# Dependency-light on purpose (mirrors the unidpp-registry / unidpp-resolver
+# doctrine): axum/tokio for serving, serde_json for documents. All trust
+# graph, signature, revocation and scope machinery lives in the path-
+# dependency crates; this service is the HTTP projection of signatif
+# state plus the service keyring that signs responses. No tracing, no
+# metrics, no TLS stack (terminate at a fronting proxy), no database
+# (the JSONL journal is the storage).
+[dependencies]
+unidpp-model = { path = "../unidpp-core/crates/model" }
+unidpp-signatif = { path = "../unidpp-signatif" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
+serde_json = "1"
