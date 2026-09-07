@@ -6,8 +6,25 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: unidpp-trust
     steps:
+      # The crate path-depends on the sibling repositories; check
+      # them out side by side, mirroring the family layout the
+      # manifests assume.
       - uses: actions/checkout@v4
+        with:
+          path: unidpp-trust
+      - uses: actions/checkout@v4
+        with:
+          repository: unidpp/unidpp-core
+          path: unidpp-core
+      - uses: actions/checkout@v4
+        with:
+          repository: unidpp/unidpp-signatif
+          path: unidpp-signatif
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
