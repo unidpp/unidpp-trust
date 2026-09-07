@@ -1,6 +1,6 @@
 //! UniDPP trust-list service (crate `unidpp-trust`).
 //!
-//! Part of UniDPP (github.com/unidpp) — implements TODO.impl
+//! Part of UniDPP (github.com/unidpp) — part of UniDPP
 //! `10-remaining-tasks-definitive.md` item 20: a running trust-list
 //! service so a verdict verifier **fetches live trust state**
 //! instead of embedding fixtures. The model and semantics come
