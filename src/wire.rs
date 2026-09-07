@@ -141,6 +141,17 @@ pub fn revoked_subject_to_value(subject: &RevokedSubject) -> Value {
             "id": p.to_string(),
             "label": format!("passport:{}", p.as_str()),
         }),
+        RevokedSubject::Condition { node, condition } => json!({
+            "kind": "condition",
+            "id": format!("{node}:`{condition}`"),
+            "label": format!("condition:{node}:`{condition}`"),
+            // The structured form: the condition rides as its own
+            // serde shape, so the round trip never parses the display
+            // string.
+            "node": node.to_string(),
+            "condition": serde_json::to_value(condition)
+                .expect("scope conditions are plain serde data"),
+        }),
     }
 }
 
@@ -165,8 +176,23 @@ pub fn revoked_subject_from_value(v: &Value) -> Result<RevokedSubject, String> {
         "passport" => Ok(RevokedSubject::Passport(
             unidpp_model::PassportId::new(id).map_err(|e| format!("`id`: {e}"))?,
         )),
+        "condition" => {
+            let node = NodeId::new(
+                obj.get("node")
+                    .and_then(Value::as_str)
+                    .ok_or("`node` is required for `condition`")?,
+            )
+            .map_err(|e| format!("`node`: {e}"))?;
+            let condition: unidpp_signatif::scope::ScopeCondition = serde_json::from_value(
+                obj.get("condition")
+                    .cloned()
+                    .ok_or("`condition` (the scope-condition object) is required")?,
+            )
+            .map_err(|e| format!("`condition`: {e}"))?;
+            Ok(RevokedSubject::Condition { node, condition })
+        }
         other => Err(format!(
-            "unknown subject kind `{other}` (expected key|node|passport)"
+            "unknown subject kind `{other}` (expected key|node|passport|condition)"
         )),
     }
 }
@@ -186,6 +212,14 @@ pub fn revoked_subject_from_label(s: &str) -> Result<RevokedSubject, String> {
         "passport" => Ok(RevokedSubject::Passport(
             unidpp_model::PassportId::new(id).map_err(|e| format!("`id`: {e}"))?,
         )),
+        // The label form cannot carry a condition subject (its id
+        // embeds the condition's display string, which is not a
+        // parseable grammar) — the structured JSON form carries it.
+        "condition" => Err(
+            "condition subjects use the structured form (kind: \"condition\", node, condition), \
+             not the label form"
+                .to_string(),
+        ),
         other => Err(format!(
             "unknown subject kind `{other}` (expected key|node|passport)"
         )),
@@ -215,7 +249,8 @@ pub fn reason_to_value(reason: &RevocationReason) -> Value {
         RevocationReason::Cessation
         | RevocationReason::AffiliationChange
         | RevocationReason::Misissuance
-        | RevocationReason::FraudulentIssuance => {}
+        | RevocationReason::FraudulentIssuance
+        | RevocationReason::ConditionWithdrawal => {}
     }
     Value::Object(m)
 }
@@ -254,6 +289,7 @@ pub fn reason_from_value(v: &Value) -> Result<RevocationReason, String> {
         "authority-compromised" => Ok(RevocationReason::AuthorityCompromised {
             detected_at: req_ts("detected_at")?,
         }),
+        "condition-withdrawal" => Ok(RevocationReason::ConditionWithdrawal),
         other => Err(format!("unknown reason token `{other}`")),
     }
 }
@@ -782,6 +818,13 @@ pub fn map_signatif_error(e: SignatifError) -> (u16, String) {
         SignatifError::QuorumRequired { subject } => (
             422,
             format!("retroactive distrust of `{subject}` requires a quorate attestation"),
+        ),
+        SignatifError::ScopeConditionFailed { condition } => {
+            (400, format!("scope condition failed: `{condition}`"))
+        }
+        SignatifError::Unsupported { suite, detail } => (
+            400,
+            format!("suite `{suite}` is unsupported in this build: {detail}"),
         ),
     }
 }
