@@ -67,11 +67,13 @@ impl Url {
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
+    #[allow(dead_code)]
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 impl HttpResponse {
+    #[allow(dead_code)]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()

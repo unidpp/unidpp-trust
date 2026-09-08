@@ -34,7 +34,7 @@
 //! | `POST /trust-lists/{jur}/entries` | upsert a single entry (`superseded_at` = withdrawal) |
 //! | `POST /master-list/witnesses` | replace the witness set (m + keys) |
 //! | `POST /master-list/entries` | upsert a master-list entry (re-verified live) |
-//! | `POST /revocations` | declare (retroactive requires a quorate attestation) |
+//! | `POST /revocations` | declare (retroactive requires a quorate attestation: member-key slots, or a threshold-ceremony group signature pinned on the quorum node — see `quorum`) |
 //! | `GET /admin/log?limit=&offset=` | append-only audit log |
 
 use std::collections::{BTreeMap, HashMap};
@@ -808,39 +808,21 @@ async fn revocations(
                 "suspended-from"
             };
             let verifications_at_stand = !voids_at_as_of;
-            let quorate = if r.reason.is_retroactive() {
+            let v = if r.reason.is_retroactive() {
                 r.quorum
                     .as_ref()
-                    .map(|q| {
-                        q.is_quorate(&r.statement_bytes(), &store.graph.key_directory())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
+                    .map(|q| crate::quorum::verdict(&store.graph, q, &r.statement_bytes()))
             } else {
-                false
+                None
             };
+            let quorate = v.as_ref().map(|v| v.quorate).unwrap_or(false);
             let quorum_view = r.quorum.as_ref().map(|q| {
-                let payload = unidpp_signatif::revoke::QuorumAttestation::canonical_bytes(
-                    &r.statement_bytes(),
-                    &q.quorum,
-                    q.threshold,
-                );
-                let mut verified: std::collections::BTreeSet<_> = Default::default();
-                for slot in &q.signatures {
-                    if let Some(pub_) = store.graph.key_directory().resolve(&slot.key_id) {
-                        if slot
-                            .verify(unidpp_signatif::sign::SigningDomain::Quorum, &payload, pub_)
-                            .is_ok()
-                        {
-                            verified.insert(slot.key_id.clone());
-                        }
-                    }
-                }
-                let verified_count = verified.len();
                 json!({
                     "quorum": q.quorum.to_string(),
                     "threshold": q.threshold,
-                    "verified_count": verified_count,
+                    "form": v.as_ref().map(|v| v.form.token()),
+                    "verified_count": v.as_ref().map(|v| v.member_verified),
+                    "group_verified": v.as_ref().map(|v| v.group_verified),
                     "quorate": quorate,
                     "signatures": q.signatures.iter().map(slot_to_value).collect::<Vec<_>>(),
                 })

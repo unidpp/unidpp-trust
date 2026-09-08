@@ -16,7 +16,12 @@ rust-version = "1.75"
 # (the JSONL journal is the storage).
 [dependencies]
 unidpp-model = { path = "../unidpp-core/crates/model" }
-unidpp-signatif = { path = "../unidpp-signatif" }
+# `confium` gates signatif's RealCeremony (the Confium-seam wrapper
+# over its own threshold cryptography). It is an empty feature — no
+# additional crates — but it is a NORMAL dependency here (not dev-only)
+# because the `quorum-ceremony` operator binary drives the ceremony to
+# produce threshold-group quorum attestations this service accepts.
+unidpp-signatif = { path = "../unidpp-signatif", features = ["confium"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
 serde_json = "1"

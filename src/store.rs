@@ -373,12 +373,14 @@ impl Store {
     fn apply_op(&mut self, op: &Op) -> Result<(), StoreError> {
         match op {
             Op::RegisterNode { node } => {
-                // Merge: insert if absent, else merge keys into the
-                // existing node. The signatif graph is idempotent on
-                // insert; we extend by registering any keys not yet
-                // known to the same node.
+                // Merge: insert if absent, else take the incoming
+                // kind (the node IS the operator's assertion — a
+                // re-registered quorum node's threshold is the
+                // current assertion, not historical) and merge keys
+                // not yet known to the same node.
                 self.graph.add_node(node.clone());
                 if let Some(existing) = self.graph.node_mut(&node.id) {
+                    existing.kind = node.kind.clone();
                     for k in &node.keys {
                         if !existing.keys.iter().any(|ek| ek.key_id == k.key_id) {
                             existing.keys.push(k.clone());
@@ -470,16 +472,13 @@ impl Store {
                             revocation.subject.label()
                         ))
                     })?;
-                    let directory = self.graph.key_directory();
-                    if !quorum
-                        .is_quorate(&revocation.statement_bytes(), &directory)
-                        .map_err(|e| StoreError::Invalid(e.to_string()))?
-                    {
+                    let v =
+                        crate::quorum::verdict(&self.graph, quorum, &revocation.statement_bytes());
+                    if !v.quorate {
                         return Err(StoreError::Invalid(format!(
-                            "quorum attestation for `{}` does not reach the threshold ({} verified, threshold {})",
+                            "quorum attestation for `{}` does not reach the threshold ({})",
                             revocation.subject.label(),
-                            Self::quorum_verified(quorum, &revocation.statement_bytes(), &directory),
-                            quorum.threshold
+                            v.summary()
                         )));
                     }
                 }
@@ -488,34 +487,6 @@ impl Store {
                     .map_err(|e| StoreError::Invalid(e.to_string()))
             }
         }
-    }
-
-    fn quorum_verified(
-        quorum: &unidpp_signatif::revoke::QuorumAttestation,
-        statement: &[u8],
-        directory: &unidpp_signatif::graph::KeyDirectory,
-    ) -> usize {
-        let mut verified: std::collections::BTreeSet<_> = Default::default();
-        let payload = unidpp_signatif::revoke::QuorumAttestation::canonical_bytes(
-            statement,
-            &quorum.quorum,
-            quorum.threshold,
-        );
-        for slot in &quorum.signatures {
-            if let Some(public) = directory.resolve(&slot.key_id) {
-                if slot
-                    .verify(
-                        unidpp_signatif::sign::SigningDomain::Quorum,
-                        &payload,
-                        public,
-                    )
-                    .is_ok()
-                {
-                    verified.insert(slot.key_id.clone());
-                }
-            }
-        }
-        verified.len()
     }
 
     fn seed_fixtures(&mut self) {
@@ -655,14 +626,12 @@ impl Store {
                     revocation.subject.label()
                 ))
             })?;
-            let directory = self.graph.key_directory();
-            if !quorum
-                .is_quorate(&revocation.statement_bytes(), &directory)
-                .map_err(|e| StoreError::Invalid(e.to_string()))?
-            {
+            let v = crate::quorum::verdict(&self.graph, quorum, &revocation.statement_bytes());
+            if !v.quorate {
                 return Err(StoreError::Invalid(format!(
-                    "quorum attestation for `{}` does not reach the threshold",
-                    revocation.subject.label()
+                    "quorum attestation for `{}` does not reach the threshold ({})",
+                    revocation.subject.label(),
+                    v.summary()
                 )));
             }
         }

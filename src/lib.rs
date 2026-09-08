@@ -62,6 +62,7 @@
 pub mod api;
 pub mod hex;
 pub mod keyring;
+pub mod quorum;
 pub mod seed;
 pub mod store;
 pub mod time;
