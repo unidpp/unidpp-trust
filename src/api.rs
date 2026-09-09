@@ -365,6 +365,8 @@ fn cache_for(at: Option<Timestamp>) -> CachePolicy {
 async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     let body = json!({
         "service": "unidpp-trust",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_id": option_env!("UNIDPP_BUILD_ID").unwrap_or("dev"),
         "description": "UniDPP trust-list service: jurisdiction trust lists per framework, M-of-K multi-witness master list, live reason-to-retroactivity revocations. All responses signed in the tree-head domain.",
         "signing": {
             "domain": "tree-head",
