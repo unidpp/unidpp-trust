@@ -92,6 +92,48 @@ pub enum Op {
     /// attestation that verifies against the trust-graph key
     /// directory; prospective reasons need no quorum.
     DeclareRevocation { revocation: Revocation },
+    /// Register a gated evidence document (TODO.impl 224): the
+    /// bytes behind an attestation, released only under its required
+    /// scope.
+    RegisterEvidence { evidence: Evidence },
+    /// Record an evidence release — the access decision (who asked,
+    /// what was released, under which scope), journaled so the audit
+    /// trail is the journal.
+    EvidenceReleased {
+        id: String,
+        requester: Option<String>,
+        scope: String,
+    },
+}
+
+/// A gated evidence document (TODO.impl 224): the MobileQR
+/// `getbase64str` pattern with the honesty doctrine applied — the
+/// document is never a bare URL, it is released under a declared
+/// scope, and every release is an audited event. Denials are stated
+/// responses naming the required scope; only releases are journaled
+/// (a refusal creates no record an attacker could flood).
+#[derive(Debug, Clone)]
+pub struct Evidence {
+    pub id: String,
+    pub content_type: String,
+    pub description: String,
+    pub required_scope: String,
+    pub content: Vec<u8>,
+}
+
+impl Evidence {
+    /// Metadata without the content (list/admin views). Content
+    /// integrity rides the signed release response — the service
+    /// signs the exact bytes it returns.
+    pub fn meta_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "content_type": self.content_type,
+            "description": self.description,
+            "required_scope": self.required_scope,
+            "content_bytes": self.content.len(),
+        })
+    }
 }
 
 /// One audit record in the journal.
@@ -154,6 +196,28 @@ impl AuditRecord {
             Op::DeclareRevocation { revocation } => {
                 ("declare-revocation", revocation_to_value(revocation))
             }
+            Op::RegisterEvidence { evidence } => (
+                "register-evidence",
+                json!({
+                    "id": evidence.id,
+                    "content_type": evidence.content_type,
+                    "description": evidence.description,
+                    "required_scope": evidence.required_scope,
+                    "content_hex": crate::hex::hex_encode(&evidence.content),
+                }),
+            ),
+            Op::EvidenceReleased {
+                id,
+                requester,
+                scope,
+            } => (
+                "evidence-released",
+                json!({
+                    "id": id,
+                    "requester": requester,
+                    "scope": scope,
+                }),
+            ),
         };
         let mut m = serde_json::Map::new();
         m.insert("op".into(), json!(op_name));
@@ -282,6 +346,66 @@ impl AuditRecord {
                 let revocation = revocation_from_value(body)?;
                 Op::DeclareRevocation { revocation }
             }
+            "register-evidence" => {
+                let b = body
+                    .as_object()
+                    .ok_or("`body` not an object")?;
+                let id = b
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("`id` is required")?
+                    .to_string();
+                let content_type = b
+                    .get("content_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let description = b
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let required_scope = b
+                    .get("required_scope")
+                    .and_then(Value::as_str)
+                    .ok_or("`required_scope` is required")?
+                    .to_string();
+                let content = crate::hex::hex_decode(
+                    b.get("content_hex")
+                        .and_then(Value::as_str)
+                        .ok_or("`content_hex` is required")?,
+                )?;
+                Op::RegisterEvidence {
+                    evidence: Evidence {
+                        id,
+                        content_type,
+                        description,
+                        required_scope,
+                        content,
+                    },
+                }
+            }
+            "evidence-released" => {
+                let b = body
+                    .as_object()
+                    .ok_or("`body` not an object")?;
+                Op::EvidenceReleased {
+                    id: b
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or("`id` is required")?
+                        .to_string(),
+                    requester: b
+                        .get("requester")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    scope: b
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .ok_or("`scope` is required")?
+                        .to_string(),
+                }
+            }
             other => return Err(format!("unknown `op` `{other}`")),
         };
         Ok(AuditRecord {
@@ -302,6 +426,8 @@ pub struct Store {
     pub frameworks: HashMap<String, Option<String>>,
     pub master: MasterList,
     pub ledger: RevocationLedger,
+    /// Gated evidence documents, keyed by id (TODO.impl 224).
+    pub evidence: HashMap<String, Evidence>,
     pub log: Vec<AuditRecord>,
     pub journal: Option<File>,
 }
@@ -319,6 +445,7 @@ impl Store {
             frameworks: HashMap::new(),
             master: MasterList::new(1, BTreeMap::new()),
             ledger: RevocationLedger::new(),
+            evidence: HashMap::new(),
             log: Vec::new(),
             journal: None,
         };
@@ -486,6 +613,17 @@ impl Store {
                     .declare(revocation.clone())
                     .map_err(|e| StoreError::Invalid(e.to_string()))
             }
+            Op::RegisterEvidence { evidence } => {
+                if self.evidence.contains_key(&evidence.id) {
+                    return Err(StoreError::Conflict(format!(
+                        "evidence `{}` is already registered",
+                        evidence.id
+                    )));
+                }
+                self.evidence.insert(evidence.id.clone(), evidence.clone());
+                Ok(())
+            }
+            Op::EvidenceReleased { .. } => Ok(()),
         }
     }
 
@@ -648,6 +786,73 @@ impl Store {
     }
 
     // -- reads ----------------------------------------------------------
+
+    /// Register a gated evidence document (validated: id present,
+    /// scope non-empty, content non-empty; conflict on re-registration
+    /// — supersession of evidence is a new id, not an edit).
+    pub fn register_evidence(&mut self, evidence: Evidence) -> Result<AuditRecord, StoreError> {
+        if self.evidence.contains_key(&evidence.id) {
+            return Err(StoreError::Conflict(format!(
+                "evidence `{}` is already registered",
+                evidence.id
+            )));
+        }
+        if evidence.id.trim().is_empty() {
+            return Err(StoreError::Invalid("`id` must not be empty".into()));
+        }
+        if evidence.required_scope.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "`required_scope` must not be empty — ungated evidence is a public link, not evidence".into(),
+            ));
+        }
+        if evidence.content.is_empty() {
+            return Err(StoreError::Invalid("`content_hex` must not be empty".into()));
+        }
+        Ok(self.record(Op::RegisterEvidence { evidence }))
+    }
+
+    /// Release an evidence document under `scope`. The refusal is a
+    /// `StoreError::Invalid` naming the required scope (the API maps
+    /// it to the stated 403); a release journals the access decision.
+    pub fn release_evidence(
+        &mut self,
+        id: &str,
+        requester: Option<String>,
+        scope: &str,
+    ) -> Result<Evidence, StoreError> {
+        let evidence = self
+            .evidence
+            .get(id)
+            .ok_or_else(|| StoreError::NotFound(format!("no evidence `{id}`")))?;
+        if scope != evidence.required_scope {
+            return Err(StoreError::Invalid(format!(
+                "evidence `{id}` requires scope `{}` — the request carried `{scope}`",
+                evidence.required_scope
+            )));
+        }
+        let released = evidence.clone();
+        self.record(Op::EvidenceReleased {
+            id: id.to_string(),
+            requester,
+            scope: scope.to_string(),
+        });
+        Ok(released)
+    }
+
+    /// The evidence catalogue (metadata only — no content).
+    pub fn evidence_list_json(&self) -> Value {
+        let mut items: Vec<&Evidence> = self.evidence.values().collect();
+        items.sort_by(|a, b| a.id.cmp(&b.id));
+        json!({
+            "count": items.len(),
+            "items": items.iter().map(|e| e.meta_json()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// One evidence document's metadata, if registered.
+    pub fn evidence_meta(&self, id: &str) -> Option<Value> {
+        self.evidence.get(id).map(Evidence::meta_json)
+    }
 
     pub fn trust_list(&self, jurisdiction: &str) -> Option<&TrustList> {
         self.trust_lists.get(&jurisdiction.to_ascii_uppercase())
@@ -844,5 +1049,52 @@ mod tests {
         let list = store.trust_list("EU").unwrap();
         assert!(list.entries.contains_key(&NodeId::new("more").unwrap()));
         let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn evidence_survives_the_journal_roundtrip() {
+        // TODO.impl 224: the gated document AND its access decisions
+        // replay exactly — the audit trail is the journal.
+        let dir = std::env::temp_dir().join(format!("unidpp-trust-ev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut store = Store::open(Some(&path), false).unwrap();
+            store
+                .register_evidence(Evidence {
+                    id: "ev-ccc-cert".into(),
+                    content_type: "application/pdf".into(),
+                    description: "CCC change certificate".into(),
+                    required_scope: "market-surveillance".into(),
+                    content: b"%PDF-1.4 fake".to_vec(),
+                })
+                .unwrap();
+            store
+                .release_evidence("ev-ccc-cert", Some("customs-de".into()), "market-surveillance")
+                .unwrap();
+            // The refusal creates no record (a denial an attacker could
+            // flood is not audit content).
+            assert!(store
+                .release_evidence("ev-ccc-cert", None, "wrong")
+                .is_err());
+        }
+        let replayed = Store::open(Some(&path), false).unwrap();
+        assert_eq!(replayed.evidence.len(), 1);
+        assert_eq!(
+            replayed.evidence["ev-ccc-cert"].content,
+            b"%PDF-1.4 fake".to_vec()
+        );
+        let ops: Vec<&str> = replayed
+            .log
+            .iter()
+            .map(|r| match &r.op {
+                Op::RegisterEvidence { .. } => "register-evidence",
+                Op::EvidenceReleased { .. } => "evidence-released",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(ops.iter().filter(|o| **o == "register-evidence").count(), 1);
+        assert_eq!(ops.iter().filter(|o| **o == "evidence-released").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

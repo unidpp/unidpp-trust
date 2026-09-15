@@ -1122,3 +1122,122 @@ async fn node_and_edge_administration() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Gated evidence (TODO.impl 224 — the MobileQR getbase64str pattern)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn evidence_is_released_under_scope_and_the_access_is_journaled() {
+    let server = TestServer::spawn(Config {
+        admin_token: Some("s3cret".to_string()),
+        ..Config::default()
+    })
+    .await
+    .expect("spawn server");
+    let base = &server.base_url;
+
+    // Ungated registration is refused: evidence without a scope is a
+    // public link, not evidence.
+    let body = json!({"id": "ev-ccc-cert", "requiredScope": "", "contentHex": "00"});
+    let resp = post(base, "/admin/evidence", &body, Some("s3cret")).await;
+    assert_eq!(resp.status, 400);
+    assert!(resp.body_string().contains("ungated evidence"));
+
+    // Register the CCC certificate document, gated to a verifier scope.
+    let pdf: Vec<u8> = b"%PDF-1.4 fake ccc certificate 2025010914819023".to_vec();
+    let body = json!({
+        "id": "ev-ccc-cert",
+        "contentType": "application/pdf",
+        "description": "CCC change certificate 2025010914819023",
+        "requiredScope": "market-surveillance",
+        "contentHex": hex_encode(&pdf),
+    });
+    let resp = post(base, "/admin/evidence", &body, Some("s3cret")).await;
+    assert_eq!(resp.status, 201, "{}", resp.body_string());
+    // Re-registration conflicts: supersession of evidence is a new id,
+    // never an edit.
+    assert_eq!(
+        post(base, "/admin/evidence", &body, Some("s3cret")).await.status,
+        409
+    );
+    // Unguarded registration is refused like every mutation.
+    assert_eq!(post(base, "/admin/evidence", &body, None).await.status, 401);
+
+    // The catalogue is public and metadata-only — content never lists.
+    let cat = get(&format!("{base}/evidence")).await;
+    assert_eq!(cat.status, 200);
+    assert_eq!(
+        json_of(&cat)["items"][0]["required_scope"],
+        json!("market-surveillance")
+    );
+    assert!(!cat.body_string().contains("content_hex"));
+
+    // No scope: a STATED 403 naming the required scope — never a
+    // silent 404 (an absent scope is an access denial, not a missing
+    // document).
+    let resp = get(&format!("{base}/evidence/ev-ccc-cert")).await;
+    assert_eq!(resp.status, 403);
+    assert!(resp.body_string().contains("requires scope `market-surveillance`"));
+
+    // The wrong scope states the refusal the same way.
+    let resp = get(&format!("{base}/evidence/ev-ccc-cert?scope=consumer")).await;
+    assert_eq!(resp.status, 403);
+    assert!(resp.body_string().contains("the request carried `consumer`"));
+
+    // Unknown id: stated 404.
+    let resp = get(&format!("{base}/evidence/ev-unknown")).await;
+    assert_eq!(resp.status, 404);
+    assert!(resp.body_string().contains("no evidence `ev-unknown`"));
+
+    // The right scope (query parameter): the exact bytes, the
+    // registered content type, signed over the bytes returned.
+    let resp = get(&format!(
+        "{base}/evidence/ev-ccc-cert?scope=market-surveillance&requester=customs-de"
+    ))
+    .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("content-type").unwrap(), "application/pdf");
+    assert_eq!(resp.body, pdf);
+    assert!(resp.header("x-sig-ed25519").is_some());
+    assert!(resp.header("x-sig-ecdsa-p256").is_some());
+    assert_eq!(resp.header("x-unidpp-scope").unwrap(), "market-surveillance");
+
+    // The header form serves the same gate (X-UniDPP-Scope).
+    let url = support::Url::parse(&format!("{base}/evidence/ev-ccc-cert")).unwrap();
+    let resp = support::request(
+        "GET",
+        &url,
+        &[("x-unidpp-scope".to_string(), "market-surveillance".to_string())],
+        None,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, pdf);
+
+    // The release is journaled: the access decision (who asked, what
+    // was released, under which scope) is an audit record.
+    let log = support::json_request(
+        "GET",
+        &format!("{base}/admin/log?limit=100"),
+        None,
+        Some("s3cret"),
+    )
+    .await;
+    assert_eq!(log.status, 200);
+    let records = json_of(&log)["records"].as_array().unwrap().clone();
+    let releases: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["op"] == json!("evidence-released"))
+        .collect();
+    assert_eq!(releases.len(), 2, "query-param and header releases");
+    assert!(releases
+        .iter()
+        .any(|r| r["body"]["id"] == json!("ev-ccc-cert")
+            && r["body"]["scope"] == json!("market-surveillance")
+            && r["body"]["requester"] == json!("customs-de")));
+
+    server.stop().await;
+}

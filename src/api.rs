@@ -392,6 +392,8 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
             "trust_list_one": "GET /trust-lists/{jur}?at=",
             "master_list": "GET /master-list",
             "revocations": "GET /revocations?at=&known_by=&window=&subject=&retroactive=",
+            "evidence_catalogue": "GET /evidence — metadata only (ids, content types, required scopes, sizes); content never listed",
+            "evidence_release": "GET /evidence/{id}?scope= (or X-UniDPP-Scope; requester via ?requester= / X-UniDPP-Requester) — released bytes signed over; an unsatisfying scope is a stated 403 naming the required scope; every release journaled",
             "graph": "GET /graph",
             "anchor_bundle": "GET /anchor-bundle?jurisdiction=",
             "admin_log": "GET /admin/log?limit=&offset=",
@@ -874,6 +876,170 @@ async fn revocations(
 // Admin — mutations
 // ---------------------------------------------------------------------------
 
+/// GET /evidence — the public catalogue: metadata only (ids, content
+/// types, required scopes, sizes). Content never appears here; a
+/// document is released only under its scope.
+async fn evidence_catalogue(State(app): State<Arc<AppState>>) -> Response {
+    let doc = {
+        let store = app.store.lock().expect("store poisoned");
+        store.evidence_list_json()
+    };
+    signed(&app, StatusCode::OK, &doc, Timestamp::now(), CachePolicy::Current)
+}
+
+/// GET /evidence/{id}?scope=... — release a gated evidence document
+/// (TODO.impl 224): the MobileQR `getbase64str` pattern with the
+/// honesty doctrine applied. The scope arrives as the `scope` query
+/// parameter or the `X-UniDPP-Scope` header (the parameter outranks
+/// the header); the requester, when presented, as `requester` or
+/// `X-UniDPP-Requester`. A scope that does not satisfy the
+/// registration is a **stated 403 naming the required scope** — never
+/// a silent 404; a release journals the access decision and the
+/// response is signed over the exact bytes returned (integrity is the
+/// signature, not a digest field).
+async fn evidence_release(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let scope = params
+        .get("scope")
+        .cloned()
+        .or_else(|| header("x-unidpp-scope"))
+        .unwrap_or_default();
+    let requester = params
+        .get("requester")
+        .cloned()
+        .or_else(|| header("x-unidpp-requester"));
+    let released = {
+        let mut store = app.store.lock().expect("store poisoned");
+        store.release_evidence(&id, requester, &scope)
+    };
+    match released {
+        Ok(evidence) => {
+            let body_bytes = evidence.content.clone();
+            let mut resp_headers = vec![
+                ("content-type".into(), evidence.content_type.clone()),
+                ("x-as-of".into(), Timestamp::now().to_string()),
+                ("x-unidpp-scope".into(), evidence.required_scope.clone()),
+            ];
+            resp_headers.extend(sign_headers(&app, &body_bytes));
+            let mut builder = Response::builder().status(StatusCode::OK);
+            for (k, v) in resp_headers {
+                builder = builder.header(k, v);
+            }
+            builder
+                .body(axum::body::Body::from(body_bytes))
+                .expect("evidence response parts are valid")
+        }
+        // The scope refusal is stated with the required scope (403),
+        // never a silent 404 — an absent scope is an access denial,
+        // not a missing document.
+        Err(StoreError::Invalid(msg)) => signed(
+            &app,
+            StatusCode::FORBIDDEN,
+            &json!({ "error": msg }),
+            Timestamp::now(),
+            CachePolicy::NoStore,
+        ),
+        Err(StoreError::NotFound(msg)) => not_found(&app, &msg),
+        Err(StoreError::Conflict(msg)) => conflict(&app, &msg),
+    }
+}
+
+/// POST /admin/evidence — register a gated evidence document: id,
+/// contentType, description, requiredScope, contentHex (hex-encoded
+/// bytes; the journal stores the same encoding, so replay is exact).
+async fn register_evidence(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return deny;
+    }
+    let v = match parse_body(&body) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&app, &e),
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return bad_request(&app, "body must be a JSON object"),
+    };
+    let id = match obj.get("id").and_then(Value::as_str) {
+        Some(i) if !i.trim().is_empty() => i.to_string(),
+        _ => return bad_request(&app, "`id` is required"),
+    };
+    let required_scope = match obj.get("requiredScope").and_then(Value::as_str) {
+        Some(sc) if !sc.trim().is_empty() => sc.to_string(),
+        _ => {
+            return bad_request(
+                &app,
+                "`requiredScope` is required — ungated evidence is a public link, not evidence",
+            )
+        }
+    };
+    let content = match obj.get("contentHex").and_then(Value::as_str) {
+        Some(h) => match crate::hex::hex_decode(h) {
+            Ok(b) => b,
+            Err(e) => return bad_request(&app, &format!("`contentHex`: {e}")),
+        },
+        None => return bad_request(&app, "`contentHex` is required"),
+    };
+    let evidence = crate::store::Evidence {
+        id,
+        content_type: obj
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        description: obj
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        required_scope,
+        content,
+    };
+    let meta = {
+        let mut store = app.store.lock().expect("store poisoned");
+        match store.register_evidence(evidence) {
+            Ok(rec) => {
+                let mut m = store
+                    .evidence_meta(&rec_op_id(&rec))
+                    .unwrap_or_else(|| json!({}));
+                if let Some(o) = m.as_object_mut() {
+                    o.insert("audit_seq".into(), json!(rec.seq));
+                }
+                m
+            }
+            Err(e) => return store_error(&app, e),
+        }
+    };
+    signed(
+        &app,
+        StatusCode::CREATED,
+        &meta,
+        Timestamp::now(),
+        CachePolicy::NoStore,
+    )
+}
+
+/// The id of the evidence a RegisterEvidence record carries.
+fn rec_op_id(rec: &crate::store::AuditRecord) -> String {
+    match &rec.op {
+        crate::store::Op::RegisterEvidence { evidence } => evidence.id.clone(),
+        _ => String::new(),
+    }
+}
+
 async fn admin_log(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1222,7 +1388,10 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/trust-lists/{jur}", get(trust_list_one))
         .route("/master-list", get(master_list))
         .route("/revocations", get(revocations))
+        .route("/evidence", get(evidence_catalogue))
+        .route("/evidence/{id}", get(evidence_release))
         .route("/admin/log", get(admin_log))
+        .route("/admin/evidence", post(register_evidence))
         .route("/nodes", post(register_node))
         .route("/edges", post(add_edge))
         .route("/trust-lists", post(register_trust_list))
