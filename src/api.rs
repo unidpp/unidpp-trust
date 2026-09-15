@@ -392,6 +392,7 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
             "trust_list_one": "GET /trust-lists/{jur}?at=",
             "master_list": "GET /master-list",
             "revocations": "GET /revocations?at=&known_by=&window=&subject=&retroactive=",
+            "operators": "GET /operators/{node}?at= — the operator surface: identity (kind, keys), delegation position (edges with scopes), trust-list memberships with validity windows (not_before/superseded_at), master-list attestations, revocation standing",
             "evidence_catalogue": "GET /evidence — metadata only (ids, content types, required scopes, sizes); content never listed",
             "evidence_release": "GET /evidence/{id}?scope= (or X-UniDPP-Scope; requester via ?requester= / X-UniDPP-Requester) — released bytes signed over; an unsatisfying scope is a stated 403 naming the required scope; every release journaled",
             "graph": "GET /graph",
@@ -875,6 +876,109 @@ async fn revocations(
 // ---------------------------------------------------------------------------
 // Admin — mutations
 // ---------------------------------------------------------------------------
+
+/// GET /operators/{node}?at= — the operator surface (TODO.impl 224):
+/// one operator's credential directory rendered from the same
+/// registries (MobileQR's firm page + credential 有效期 counterpart):
+/// identity (kind, registered keys), delegation position (edges in
+/// and out with their scopes), trust-list memberships **with their
+/// validity windows** (`not_before` / `superseded_at`), master-list
+/// attestations, and revocation standing. An unknown operator is a
+/// stated 404.
+async fn operator_view(
+    State(app): State<Arc<AppState>>,
+    Path(node): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let at = match parse_at(&params) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&app, &e),
+    };
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let Ok(node_id) = unidpp_signatif::graph::NodeId::new(&node) else {
+        return bad_request(&app, &format!("`{node}` is not a valid operator node id"));
+    };
+    let doc = {
+        let store = app.store.lock().expect("store poisoned");
+        let Some(dn) = store.graph.node(&node_id) else {
+            return not_found(&app, &format!("no operator `{node}`"));
+        };
+        let keys: Vec<Value> = dn
+            .keys
+            .iter()
+            .map(|k| {
+                json!({
+                    "key_id": k.key_id.to_string(),
+                    "suite": k.public.suite().to_string(),
+                })
+            })
+            .collect();
+        // Delegation position: edges in and out, scopes carried.
+        let mut edges_in: Vec<Value> = Vec::new();
+        let mut edges_out: Vec<Value> = Vec::new();
+        for e in store.graph.edges() {
+            let v = crate::wire::edge_to_value(e);
+            if e.child == node_id {
+                edges_in.push(v);
+            } else if e.parent == node_id {
+                edges_out.push(v);
+            }
+        }
+        // Trust-list memberships with validity windows — the
+        // operator's credential directory.
+        let mut memberships: Vec<Value> = Vec::new();
+        for (jur, list) in &store.trust_lists {
+            for entry in list.entries.values() {
+                if entry.node == node_id {
+                    memberships.push(json!({
+                        "jurisdiction": jur,
+                        "not_before": crate::time::Timestamp::from_model(entry.not_before).to_string(),
+                        "superseded_at": entry.superseded_at
+                            .map(|t| crate::time::Timestamp::from_model(t).to_string()),
+                        "in_force_at_as_of": entry.in_force_at(as_of.to_model()),
+                    }));
+                }
+            }
+        }
+        memberships.sort_by(|a, b| a["jurisdiction"].as_str().cmp(&b["jurisdiction"].as_str()));
+        // Master-list standing: witness attestations over this node.
+        let master = store
+            .master
+            .entries
+            .get(&node_id)
+            .map(|entry| {
+                json!({
+                    "attested_by": entry.attestations.len(),
+                    "witnesses": entry
+                        .attestations
+                        .iter()
+                        .map(|a| a.witness.to_string())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .unwrap_or(Value::Null);
+        // Revocation standing: declarations naming this node.
+        let revocations: Vec<Value> = store
+            .ledger
+            .revocations()
+            .iter()
+            .filter(|r| matches!(&r.subject, unidpp_signatif::revoke::RevokedSubject::Node(id) if id == &node_id))
+            .map(crate::wire::revocation_to_value)
+            .collect();
+        json!({
+            "operator": node_id.to_string(),
+            "kind": format!("{:?}", dn.kind),
+            "keys": keys,
+            "delegated_by": edges_in,
+            "delegates": edges_out,
+            "trust_list_memberships": memberships,
+            "master_list": master,
+            "revocations": revocations,
+            "as_of": as_of.to_string(),
+        })
+    };
+    signed(&app, StatusCode::OK, &doc, as_of, CachePolicy::Current)
+}
 
 /// GET /evidence — the public catalogue: metadata only (ids, content
 /// types, required scopes, sizes). Content never appears here; a
@@ -1388,6 +1492,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/trust-lists/{jur}", get(trust_list_one))
         .route("/master-list", get(master_list))
         .route("/revocations", get(revocations))
+        .route("/operators/{node}", get(operator_view))
         .route("/evidence", get(evidence_catalogue))
         .route("/evidence/{id}", get(evidence_release))
         .route("/admin/log", get(admin_log))

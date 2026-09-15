@@ -1241,3 +1241,46 @@ async fn evidence_is_released_under_scope_and_the_access_is_journaled() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The operator surface (TODO.impl 224 — the firm-directory counterpart)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_operator_renders_its_credential_directory_with_validity() {
+    let server = spawn_open().await;
+    let base = &server.base_url;
+
+    // The seeded root: a full directory entry — kind, keys, membership
+    // with its validity window, master-list attestations.
+    let resp = get(&format!("{base}/operators/{}", enc("eu-root"))).await;
+    assert_eq!(resp.status, 200, "{}", resp.body_string());
+    let doc = json_of(&resp);
+    assert_eq!(doc["operator"], json!("eu-root"));
+    assert_eq!(doc["kind"], json!("Root"));
+    assert!(!doc["keys"].as_array().unwrap().is_empty());
+    let memberships = doc["trust_list_memberships"].as_array().unwrap();
+    assert!(!memberships.is_empty(), "the root is trusted somewhere");
+    let m = &memberships[0];
+    assert!(m["not_before"].as_str().is_some(), "validity window stated");
+    assert!(m["superseded_at"].is_null() || m["superseded_at"].as_str().is_some());
+    assert!(m["in_force_at_as_of"].as_bool().is_some());
+    assert!(doc["master_list"]["attested_by"].as_u64().unwrap_or(0) >= 1);
+
+    // The delegated node: edges in (delegated_by) with scopes.
+    let resp = get(&format!("{base}/operators/{}", enc("eu-notified"))).await;
+    assert_eq!(resp.status, 200);
+    let doc = json_of(&resp);
+    assert!(!doc["delegated_by"].as_array().unwrap().is_empty());
+
+    // An unknown operator is a stated 404.
+    let resp = get(&format!("{base}/operators/{}", enc("no-such-operator"))).await;
+    assert_eq!(resp.status, 404);
+    assert!(resp.body_string().contains("no operator `no-such-operator`"));
+
+    // A malformed node id is a stated 400.
+    let resp = get(&format!("{base}/operators/{}", enc("not a node id!"))).await;
+    assert_eq!(resp.status, 400);
+
+    server.stop().await;
+}
