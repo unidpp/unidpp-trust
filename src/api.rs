@@ -23,6 +23,9 @@
 //! | `GET /revocations?at=&known_by=&window=&subject=&retroactive=` | live retroactivity reading |
 //! | `GET /graph` | full trust graph (nodes + edges) — verifiers reconstruct and resolve |
 //! | `GET /anchor-bundle?jurisdiction=` | the verifier artifact (lists + master) |
+//! | `GET /evidence` | the gated-evidence catalogue (metadata only — content never lists) |
+//! | `GET /evidence/{id}` | release a gated evidence document under `?scope=` (bytes signed; unsatisfying scope = stated 403; releases journaled) |
+//! | `GET /operators/{node}` | the operator surface (`?at=`): keys, delegation position, trust-list memberships with validity windows, master-list standing, revocations |
 //!
 //! Admin (Bearer `UNIDPP_TRUST_ADMIN_TOKEN`):
 //!
@@ -36,6 +39,7 @@
 //! | `POST /master-list/entries` | upsert a master-list entry (re-verified live) |
 //! | `POST /revocations` | declare (retroactive requires a quorate attestation: member-key slots, or a threshold-ceremony group signature pinned on the quorum node — see `quorum`) |
 //! | `GET /admin/log?limit=&offset=` | append-only audit log |
+//! | `POST /admin/evidence` | register a gated evidence document (id, contentType, requiredScope, contentHex; ungated registration refused) |
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
