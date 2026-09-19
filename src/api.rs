@@ -10,36 +10,16 @@
 //! response body bytes (deterministic Ed25519 → identical bodies
 //! produce identical signatures → safe to cache with a strong `ETag`).
 //!
-//! Public reads:
-//!
-//! | Endpoint | Meaning |
-//! |---|---|
-//! | `GET /` | discovery document |
-//! | `GET /healthz` | liveness (signed JSON status) |
-//! | `GET /keyring` | public anchors a verifier pins (CLI `--anchor`) |
-//! | `GET /trust-lists?at=&jurisdiction=&framework=` | per jurisdiction + framework |
-//! | `GET /trust-lists/{jur}?at=` | one jurisdiction's list (entries with `in_force_at_as_of`) |
-//! | `GET /master-list` | M-of-K shape with witness list + per-entry live quorum verdicts |
-//! | `GET /revocations?at=&known_by=&window=&subject=&retroactive=` | live retroactivity reading |
-//! | `GET /graph` | full trust graph (nodes + edges) — verifiers reconstruct and resolve |
-//! | `GET /anchor-bundle?jurisdiction=` | the verifier artifact (lists + master) |
-//! | `GET /evidence` | the gated-evidence catalogue (metadata only — content never lists) |
-//! | `GET /evidence/{id}` | release a gated evidence document under `?scope=` (bytes signed; unsatisfying scope = stated 403; releases journaled) |
-//! | `GET /operators/{node}` | the operator surface (`?at=`): keys, delegation position, trust-list memberships with validity windows, master-list standing, revocations |
-//!
-//! Admin (Bearer `UNIDPP_TRUST_ADMIN_TOKEN`):
-//!
-//! | Endpoint | Meaning |
-//! |---|---|
-//! | `POST /nodes` | upsert a node (merges keys) |
-//! | `POST /edges` | add a delegation credential (validated) |
-//! | `POST /trust-lists` | register a new trust list |
-//! | `POST /trust-lists/{jur}/entries` | upsert a single entry (`superseded_at` = withdrawal) |
-//! | `POST /master-list/witnesses` | replace the witness set (m + keys) |
-//! | `POST /master-list/entries` | upsert a master-list entry (re-verified live) |
-//! | `POST /revocations` | declare (retroactive requires a quorate attestation: member-key slots, or a threshold-ceremony group signature pinned on the quorum node — see `quorum`) |
-//! | `GET /admin/log?limit=&offset=` | append-only audit log |
-//! | `POST /admin/evidence` | register a gated evidence document (id, contentType, requiredScope, contentHex; ungated registration refused) |
+//! The endpoint table is the served contract itself: every handler
+//! carries its `#[utoipa::path]` declaration, the document is served
+//! at `/openapi.yaml` (and `/openapi.json`), browsable at `/docs`,
+//! and committed as the golden `openapi.yaml`. The public surface
+//! (discovery, health, keyring, graph, anchor bundle, trust lists,
+//! master list, revocations, operators, evidence) carries the tag
+//! `trust`; the operator surface (node, edge, trust-list, master-list
+//! and revocation mutations, evidence registration, the audit log)
+//! carries the tag `admin` and requires the Bearer token where one is
+//! configured.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -53,6 +33,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::keyring::{Keyring, Role};
 use crate::seed;
@@ -120,33 +102,56 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The environment variables this service consumes. This is the
+    /// deployment contract: the contract document carries exactly
+    /// these names as `x-unidpp-env-keys`, and `from_env` reads the
+    /// environment only through this constant. The two signing seeds
+    /// are consumed by the service keyring (`Keyring::from_env`),
+    /// and `UNIDPP_TRUST_DEV_SEED` selects the keyring's deterministic
+    /// seeded-dev mode.
+    pub const ENV_KEYS: &'static [&'static str] = &[
+        "UNIDPP_TRUST_BIND",
+        "UNIDPP_TRUST_ADMIN_TOKEN",
+        "UNIDPP_TRUST_STATE_FILE",
+        "UNIDPP_TRUST_NO_SEED_FIXTURES",
+        "UNIDPP_TRUST_DEV_SEED",
+        "UNIDPP_TRUST_SIGN_SEED",
+        "UNIDPP_TRUST_SIGN_SEED_P256",
+    ];
+
     /// Resolve the configuration from environment variables.
     pub fn from_env() -> Config {
         let mut c = Config::default();
-        if let Ok(bind) = std::env::var("UNIDPP_TRUST_BIND") {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        for key in Self::ENV_KEYS {
+            if let Ok(value) = std::env::var(key) {
+                vars.insert(*key, value);
+            }
+        }
+        if let Some(bind) = vars.get("UNIDPP_TRUST_BIND") {
             match bind.parse() {
                 Ok(addr) => c.bind = addr,
                 Err(_) => eprintln!("unidpp-trust: ignoring bad UNIDPP_TRUST_BIND `{bind}`"),
             }
         }
-        if let Ok(token) = std::env::var("UNIDPP_TRUST_ADMIN_TOKEN") {
+        if let Some(token) = vars.get("UNIDPP_TRUST_ADMIN_TOKEN") {
             if !token.is_empty() {
-                c.admin_token = Some(token);
+                c.admin_token = Some(token.clone());
             }
         }
-        if let Ok(path) = std::env::var("UNIDPP_TRUST_STATE_FILE") {
+        if let Some(path) = vars.get("UNIDPP_TRUST_STATE_FILE") {
             if !path.is_empty() {
                 c.state_file = Some(PathBuf::from(path));
             }
         }
-        if let Ok(v) = std::env::var("UNIDPP_TRUST_NO_SEED_FIXTURES") {
+        if let Some(v) = vars.get("UNIDPP_TRUST_NO_SEED_FIXTURES") {
             if v == "1" || v.eq_ignore_ascii_case("true") {
                 c.seed_fixtures = false;
             }
         }
-        if let Ok(seed) = std::env::var("UNIDPP_TRUST_DEV_SEED") {
+        if let Some(seed) = vars.get("UNIDPP_TRUST_DEV_SEED") {
             if !seed.is_empty() {
-                c.dev_seed = Some(seed);
+                c.dev_seed = Some(seed.clone());
             }
         }
         c
@@ -366,6 +371,15 @@ fn cache_for(at: Option<Timestamp>) -> CachePolicy {
 // Handlers — discovery / health / keyring
 // ---------------------------------------------------------------------------
 
+/// Serve the discovery document.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "trust",
+    responses(
+        (status = 200, description = "The discovery document: the service identity, the signing posture (the tree-head domain, both suites, the signature headers), the endpoint table, the revocation semantics, the as-of conventions, the seed-fixture provenance and the authentication rule", body = Value, content_type = "application/json"),
+    )
+)]
 async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     let body = json!({
         "service": "unidpp-trust",
@@ -436,6 +450,15 @@ async fn discovery(State(app): State<Arc<AppState>>) -> Response {
     )
 }
 
+/// Liveness probe.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "trust",
+    responses(
+        (status = 200, description = "The service is serving; the signed status names the service and carries the as-of instant", body = Value, content_type = "application/json"),
+    )
+)]
 async fn healthz(State(app): State<Arc<AppState>>) -> Response {
     let body = json!({
         "status": "ok",
@@ -451,6 +474,15 @@ async fn healthz(State(app): State<Arc<AppState>>) -> Response {
     )
 }
 
+/// Serve the public keyring.
+#[utoipa::path(
+    get,
+    path = "/keyring",
+    tag = "trust",
+    responses(
+        (status = 200, description = "The public keyring: the keyring mode, the per-role suites, key ids and hex-encoded public anchors a verifier pins (the CLI `--anchor`), the signing domain and the verification recipe matching the response headers", body = Value, content_type = "application/json"),
+    )
+)]
 async fn keyring(State(app): State<Arc<AppState>>) -> Response {
     let mut v = app.keyring.to_json();
     if let Some(m) = v.as_object_mut() {
@@ -469,6 +501,19 @@ async fn keyring(State(app): State<Arc<AppState>>) -> Response {
 // Handlers — graph (verifier reconstruction)
 // ---------------------------------------------------------------------------
 
+/// Serve the full trust graph.
+#[utoipa::path(
+    get,
+    path = "/graph",
+    tag = "trust",
+    params(
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; the graph is rendered as of that instant (alias `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The trust graph: the node count, the edge count, the nodes and the delegation edges, stamped with the as-of instant; a verifier reconstructs the signatif objects from this document", body = Value, content_type = "application/json"),
+        (status = 400, description = "The `at` parameter is present and is not a valid RFC 3339 instant"),
+    )
+)]
 async fn graph(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -497,6 +542,21 @@ async fn graph(
     signed(&app, StatusCode::OK, &body, as_of, cache_for(at))
 }
 
+/// Serve the verifier artifact for one jurisdiction.
+#[utoipa::path(
+    get,
+    path = "/anchor-bundle",
+    tag = "trust",
+    params(
+        ("jurisdiction" = String, Query, description = "The jurisdiction whose trust list the bundle carries beside the master list"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; the bundle is rendered as of that instant (alias `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The verifier-shaped anchor bundle: the jurisdiction's trust list and the M-of-K master list, with wire-form keys a verifier rebuilds without touching the asymmetric PublicKey serde", body = Value, content_type = "application/json"),
+        (status = 400, description = "The `jurisdiction` parameter is absent, or the `at` parameter is present and is not a valid RFC 3339 instant"),
+        (status = 404, description = "No trust list exists for the requested jurisdiction"),
+    )
+)]
 async fn anchor_bundle(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -554,6 +614,21 @@ async fn anchor_bundle(
 // Handlers — trust lists
 // ---------------------------------------------------------------------------
 
+/// Serve the jurisdiction trust lists.
+#[utoipa::path(
+    get,
+    path = "/trust-lists",
+    tag = "trust",
+    params(
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; every entry carries `in_force_at_as_of` for that instant (alias `asof`)"),
+        ("jurisdiction" = Option<String>, Query, description = "Restrict the response to one jurisdiction"),
+        ("framework" = Option<String>, Query, description = "Restrict the response to the lists whose framework matches this value"),
+    ),
+    responses(
+        (status = 200, description = "The trust lists, each with its jurisdiction, framework and entries with their validity windows, sorted by jurisdiction", body = Value, content_type = "application/json"),
+        (status = 400, description = "The `at` parameter is present and is not a valid RFC 3339 instant"),
+    )
+)]
 async fn trust_lists(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -613,6 +688,21 @@ async fn trust_lists(
     signed(&app, StatusCode::OK, &body, as_of, cache_for(at))
 }
 
+/// Serve one jurisdiction's trust list.
+#[utoipa::path(
+    get,
+    path = "/trust-lists/{jur}",
+    tag = "trust",
+    params(
+        ("jur" = String, Path, description = "The jurisdiction (matched case-insensitively)"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; every entry carries `in_force_at_as_of` for that instant (alias `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The jurisdiction's trust list: jurisdiction, framework and the entries with their validity windows", body = Value, content_type = "application/json"),
+        (status = 400, description = "The `at` parameter is present and is not a valid RFC 3339 instant"),
+        (status = 404, description = "No trust list exists for the requested jurisdiction"),
+    )
+)]
 async fn trust_list_one(
     State(app): State<Arc<AppState>>,
     Path(jur): Path<String>,
@@ -657,6 +747,19 @@ async fn trust_list_one(
 // Handlers — master list (M-of-K)
 // ---------------------------------------------------------------------------
 
+/// Serve the M-of-K master list.
+#[utoipa::path(
+    get,
+    path = "/master-list",
+    tag = "trust",
+    params(
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; attestations are verified against the witness set as of that instant (alias `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The master list: the M-of-K shape, the witness list, and every entry with its attestations, the live per-attestation verification results, the verified-witness count and the quorum verdict", body = Value, content_type = "application/json"),
+        (status = 400, description = "The `at` parameter is present and is not a valid RFC 3339 instant"),
+    )
+)]
 async fn master_list(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -734,6 +837,23 @@ fn parse_window_filter(
     Ok(Some((start_ts, end_ts)))
 }
 
+/// Serve the revocation ledger with the live retroactivity reading.
+#[utoipa::path(
+    get,
+    path = "/revocations",
+    tag = "trust",
+    params(
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; each declaration is read for void-ab-initio standing at that instant (alias `asof`)"),
+        ("known_by" = Option<String>, Query, description = "An RFC 3339 evidentiary cutoff; declarations made after it keep prior as-of verifications valid"),
+        ("window" = Option<String>, Query, description = "A distrust window `START..END` (or `START,END`); declarations whose window overlaps it are returned"),
+        ("subject" = Option<String>, Query, description = "Restrict the response to declarations naming this subject (prefix match)"),
+        ("retroactive" = Option<String>, Query, description = "`true` restricts to retroactive reasons, `false` to prospective reasons"),
+    ),
+    responses(
+        (status = 200, description = "The declarations with the live reading: `known_at_cutoff`, `voids_at_as_of`, `standing_at_as_of`, the quorum verdict for retroactive declarations and the governing rule", body = Value, content_type = "application/json"),
+        (status = 400, description = "The `at`, `known_by` or `window` parameter does not parse, or `retroactive` is not a boolean"),
+    )
+)]
 async fn revocations(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -889,6 +1009,21 @@ async fn revocations(
 /// validity windows** (`not_before` / `superseded_at`), master-list
 /// attestations, and revocation standing. An unknown operator is a
 /// stated 404.
+/// Serve the operator surface for one node.
+#[utoipa::path(
+    get,
+    path = "/operators/{node}",
+    tag = "trust",
+    params(
+        ("node" = String, Path, description = "The operator's node id"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; memberships are read for force at that instant (alias `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The operator's credential directory: identity (kind, registered keys), delegation position (edges in and out with their scopes), trust-list memberships with their validity windows, master-list attestations and revocation standing", body = Value, content_type = "application/json"),
+        (status = 400, description = "The node id is not a valid operator node id, or the `at` parameter is present and is not a valid RFC 3339 instant"),
+        (status = 404, description = "No operator with this node id is known here"),
+    )
+)]
 async fn operator_view(
     State(app): State<Arc<AppState>>,
     Path(node): Path<String>,
@@ -987,12 +1122,27 @@ async fn operator_view(
 /// GET /evidence — the public catalogue: metadata only (ids, content
 /// types, required scopes, sizes). Content never appears here; a
 /// document is released only under its scope.
+/// Serve the gated-evidence catalogue.
+#[utoipa::path(
+    get,
+    path = "/evidence",
+    tag = "trust",
+    responses(
+        (status = 200, description = "The catalogue metadata only: identifiers, content types, descriptions, required scopes and sizes; document content never appears in the catalogue", body = Value, content_type = "application/json"),
+    )
+)]
 async fn evidence_catalogue(State(app): State<Arc<AppState>>) -> Response {
     let doc = {
         let store = app.store.lock().expect("store poisoned");
         store.evidence_list_json()
     };
-    signed(&app, StatusCode::OK, &doc, Timestamp::now(), CachePolicy::Current)
+    signed(
+        &app,
+        StatusCode::OK,
+        &doc,
+        Timestamp::now(),
+        CachePolicy::Current,
+    )
 }
 
 /// GET /evidence/{id}?scope=... — release a gated evidence document
@@ -1005,6 +1155,22 @@ async fn evidence_catalogue(State(app): State<Arc<AppState>>) -> Response {
 /// a silent 404; a release journals the access decision and the
 /// response is signed over the exact bytes returned (integrity is the
 /// signature, not a digest field).
+/// Release a gated evidence document under its scope.
+#[utoipa::path(
+    get,
+    path = "/evidence/{id}",
+    tag = "trust",
+    params(
+        ("id" = String, Path, description = "The evidence identifier"),
+        ("scope" = Option<String>, Query, description = "The requester's scope; the `X-UniDPP-Scope` header is accepted when the parameter is absent, and the parameter outranks the header"),
+        ("requester" = Option<String>, Query, description = "The requester identity the journal records; the `X-UniDPP-Requester` header is accepted when the parameter is absent"),
+    ),
+    responses(
+        (status = 200, description = "The document bytes are released and the signature covers the exact bytes returned; the response carries the registered content type and the required scope, and the release is journaled", body = Value, content_type = "application/octet-stream"),
+        (status = 403, description = "The presented scope does not satisfy the registration; the refusal is a stated error naming the required scope, and no release is journaled"),
+        (status = 404, description = "No evidence document with this identifier is registered"),
+    )
+)]
 async fn evidence_release(
     State(app): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1065,6 +1231,19 @@ async fn evidence_release(
 /// POST /admin/evidence — register a gated evidence document: id,
 /// contentType, description, requiredScope, contentHex (hex-encoded
 /// bytes; the journal stores the same encoding, so replay is exact).
+/// Register a gated evidence document.
+#[utoipa::path(
+    post,
+    path = "/admin/evidence",
+    tag = "admin",
+    request_body(content = Value, description = "`{{\"id\": ..., \"requiredScope\": ..., \"contentHex\": ...}}` — the bytes hex-encoded; optional `contentType` (default `application/octet-stream`) and `description`. Ungated registration is refused, and re-registration of an identifier is a conflict because supersession of evidence is a new identifier, not an edit"),
+    responses(
+        (status = 201, description = "The document is registered; its catalogue metadata and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON, a missing `id`, `requiredScope` or `contentHex`, or a `contentHex` that does not decode"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 409, description = "An evidence document with this identifier is already registered"),
+    )
+)]
 async fn register_evidence(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1148,6 +1327,20 @@ fn rec_op_id(rec: &crate::store::AuditRecord) -> String {
     }
 }
 
+/// Serve the append-only audit log.
+#[utoipa::path(
+    get,
+    path = "/admin/log",
+    tag = "admin",
+    params(
+        ("limit" = Option<u64>, Query, description = "Records to return (default 100, maximum 10 000)"),
+        ("offset" = Option<u64>, Query, description = "Records to skip (default 0)"),
+    ),
+    responses(
+        (status = 200, description = "The audit-log window: the total record count, the offset and the records", body = Value, content_type = "application/json"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 async fn admin_log(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1178,6 +1371,18 @@ async fn admin_log(
     )
 }
 
+/// Register a trust-graph node.
+#[utoipa::path(
+    post,
+    path = "/nodes",
+    tag = "admin",
+    request_body(content = Value, description = "The node document: `id` and `kind` (root, threshold-group, delegated or end); optional `keys`, which are merged into any existing registration of the same node"),
+    responses(
+        (status = 201, description = "The node is registered; the stored node and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON or an invalid node document"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 async fn register_node(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1214,6 +1419,18 @@ async fn register_node(
     )
 }
 
+/// Add a delegation credential to the trust graph.
+#[utoipa::path(
+    post,
+    path = "/edges",
+    tag = "admin",
+    request_body(content = Value, description = "The parent-signed delegation credential document: `parent`, `child`, the signature slots and the delegated scope"),
+    responses(
+        (status = 201, description = "The credential is added; the stored credential and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON, or a credential the graph rejects (an unknown endpoint, an invalid signature or a scope violation)"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 async fn add_edge(State(app): State<Arc<AppState>>, headers: HeaderMap, body: String) -> Response {
     if let Some(deny) = require_admin(&app, &headers) {
         return deny;
@@ -1246,6 +1463,19 @@ async fn add_edge(State(app): State<Arc<AppState>>, headers: HeaderMap, body: St
     )
 }
 
+/// Register a jurisdiction trust list.
+#[utoipa::path(
+    post,
+    path = "/trust-lists",
+    tag = "admin",
+    request_body(content = Value, description = "`{{\"jurisdiction\": ...}}`; optional `framework` and an initial `entries` array, which is applied after the list is registered"),
+    responses(
+        (status = 201, description = "The list is registered; the jurisdiction, the framework and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON, a missing or invalid `jurisdiction`, or an invalid entry in `entries`"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 409, description = "A trust list for this jurisdiction is already registered"),
+    )
+)]
 async fn register_trust_list(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1307,6 +1537,22 @@ async fn register_trust_list(
     )
 }
 
+/// Upsert one entry of a jurisdiction trust list.
+#[utoipa::path(
+    post,
+    path = "/trust-lists/{jur}/entries",
+    tag = "admin",
+    params(
+        ("jur" = String, Path, description = "The jurisdiction (matched case-insensitively)"),
+    ),
+    request_body(content = Value, description = "The entry: `node` and `not_before` (RFC 3339); optional `superseded_at`, an RFC 3339 instant whose presence is the withdrawal of the entry"),
+    responses(
+        (status = 201, description = "The entry is upserted; the jurisdiction, the node, the validity window and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON or an invalid entry document"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 404, description = "No trust list exists for this jurisdiction"),
+    )
+)]
 async fn upsert_trust_entry(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1353,6 +1599,18 @@ async fn upsert_trust_entry(
     )
 }
 
+/// Replace the witness set of the master list.
+#[utoipa::path(
+    post,
+    path = "/master-list/witnesses",
+    tag = "admin",
+    request_body(content = Value, description = "`{{\"m\": <threshold>, \"witnesses\": [...]}}` — the M-of-K shape is replaced wholesale by the stated threshold and witness keys"),
+    responses(
+        (status = 201, description = "The witness set is replaced; the new M-of-K shape with the rendered witnesses and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON, a missing `m` or `witnesses`, or an `m` that exceeds the witness count"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 async fn set_witnesses(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1400,6 +1658,18 @@ async fn set_witnesses(
     )
 }
 
+/// Upsert one master-list entry.
+#[utoipa::path(
+    post,
+    path = "/master-list/entries",
+    tag = "admin",
+    request_body(content = Value, description = "The entry: `node` and `attestations` (witness, instant, signature slot); every attestation must name a witness that is already registered"),
+    responses(
+        (status = 201, description = "The entry is upserted; the node, the attestations and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON, an invalid entry, or an attestation naming an unregistered witness"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 async fn upsert_master_entry(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1438,6 +1708,19 @@ async fn upsert_master_entry(
     )
 }
 
+/// Declare a revocation.
+#[utoipa::path(
+    post,
+    path = "/revocations",
+    tag = "admin",
+    request_body(content = Value, description = "The declaration: `subject`, `reason`, `declared_at` (RFC 3339), `declared_by` and `window`; a retroactive reason additionally requires a quorate attestation (member-key slots, or a threshold-ceremony group signature pinned on the quorum node — see `quorum`)"),
+    responses(
+        (status = 201, description = "The declaration is recorded; the subject, the reason, the window and the audit sequence number are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "Invalid JSON or an invalid declaration document"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 422, description = "The declaration is refused on the merits: a retroactive reason without a quorum attestation, or an attestation that does not reach the threshold"),
+    )
+)]
 async fn declare_revocation(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1482,32 +1765,112 @@ async fn declare_revocation(
 }
 
 // ---------------------------------------------------------------------------
+// Interface contract
+// ---------------------------------------------------------------------------
+
+/// The routed paths, declared once. The router routes by these
+/// constants, the contract document is tested against them, and no
+/// route may be declared with a raw literal (the gates enforce both).
+pub mod paths {
+    pub const ROOT: &str = "/";
+    pub const HEALTHZ: &str = "/healthz";
+    pub const KEYRING: &str = "/keyring";
+    pub const GRAPH: &str = "/graph";
+    pub const ANCHOR_BUNDLE: &str = "/anchor-bundle";
+    pub const TRUST_LISTS: &str = "/trust-lists";
+    pub const TRUST_LIST_ONE: &str = "/trust-lists/{jur}";
+    pub const TRUST_LIST_ENTRIES: &str = "/trust-lists/{jur}/entries";
+    pub const MASTER_LIST: &str = "/master-list";
+    pub const MASTER_LIST_WITNESSES: &str = "/master-list/witnesses";
+    pub const MASTER_LIST_ENTRIES: &str = "/master-list/entries";
+    pub const REVOCATIONS: &str = "/revocations";
+    pub const OPERATOR: &str = "/operators/{node}";
+    pub const EVIDENCE: &str = "/evidence";
+    pub const EVIDENCE_ONE: &str = "/evidence/{id}";
+    pub const ADMIN_LOG: &str = "/admin/log";
+    pub const ADMIN_EVIDENCE: &str = "/admin/evidence";
+    pub const NODES: &str = "/nodes";
+    pub const EDGES: &str = "/edges";
+    /// The contract document itself (not an operation of the API).
+    pub const CONTRACT_YAML: &str = "/openapi.yaml";
+}
+
+/// The OpenAPI model: one declaration per handler (`#[utoipa::path]`),
+/// from which the served contract, the golden file and Swagger UI all
+/// derive.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "UniDPP trust",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "UniDPP trust-list service: jurisdiction trust lists per framework, the M-of-K multi-witness master list, and live reason-to-retroactivity revocations. Every response is as-of stamped and co-signed by the service keyring in the tree-head domain (Ed25519 and ECDSA P-256 over the exact body bytes), so a verifier checks the operator's signed statement of state before it trusts the state. Seed fixtures derived from unidpp-signatif's test trust graph make the service useful to a verifier out of the box. Read operations are public; mutations and the audit log require `Authorization: Bearer <UNIDPP_TRUST_ADMIN_TOKEN>` where a token is configured.",
+        license(name = "Apache-2.0", identifier = "Apache-2.0"),
+    ),
+    paths(
+        discovery, healthz, keyring, graph, anchor_bundle, trust_lists,
+        trust_list_one, master_list, revocations, operator_view,
+        evidence_catalogue, evidence_release, admin_log, register_evidence,
+        register_node, add_edge, register_trust_list, upsert_trust_entry,
+        set_witnesses, upsert_master_entry, declare_revocation,
+    ),
+    tags(
+        (name = "trust", description = "The public surface: discovery, health, keyring, graph, anchor bundle, trust lists, master list, revocations, operators, evidence"),
+        (name = "admin", description = "The operator surface: node, edge, trust-list, master-list and revocation mutations, evidence registration, the audit log"),
+    )
+)]
+struct ApiDoc;
+
+/// The contract document: the OpenAPI model plus the deployment keys
+/// (`x-unidpp-env-keys`). Served at `/openapi.yaml` and committed as
+/// the golden `openapi.yaml`.
+pub fn contract_yaml() -> String {
+    let mut doc = serde_json::to_value(ApiDoc::openapi()).expect("contract serializes");
+    doc["info"]["x-unidpp-env-keys"] = json!(Config::ENV_KEYS);
+    serde_yaml::to_string(&doc).expect("contract renders as YAML")
+}
+
+async fn openapi_yaml() -> Response {
+    build_signed(
+        StatusCode::OK,
+        vec![("content-type".into(), "application/yaml".into())],
+        contract_yaml(),
+        CachePolicy::Current,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Router + run
 // ---------------------------------------------------------------------------
 
 pub fn router(app: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(discovery))
-        .route("/healthz", get(healthz))
-        .route("/keyring", get(keyring))
-        .route("/graph", get(graph))
-        .route("/anchor-bundle", get(anchor_bundle))
-        .route("/trust-lists", get(trust_lists))
-        .route("/trust-lists/{jur}", get(trust_list_one))
-        .route("/master-list", get(master_list))
-        .route("/revocations", get(revocations))
-        .route("/operators/{node}", get(operator_view))
-        .route("/evidence", get(evidence_catalogue))
-        .route("/evidence/{id}", get(evidence_release))
-        .route("/admin/log", get(admin_log))
-        .route("/admin/evidence", post(register_evidence))
-        .route("/nodes", post(register_node))
-        .route("/edges", post(add_edge))
-        .route("/trust-lists", post(register_trust_list))
-        .route("/trust-lists/{jur}/entries", post(upsert_trust_entry))
-        .route("/master-list/witnesses", post(set_witnesses))
-        .route("/master-list/entries", post(upsert_master_entry))
-        .route("/revocations", post(declare_revocation))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route(paths::ROOT, get(discovery))
+        .route(paths::HEALTHZ, get(healthz))
+        .route(paths::KEYRING, get(keyring))
+        .route(paths::GRAPH, get(graph))
+        .route(paths::ANCHOR_BUNDLE, get(anchor_bundle))
+        .route(
+            paths::TRUST_LISTS,
+            get(trust_lists).post(register_trust_list),
+        )
+        .route(paths::TRUST_LIST_ONE, get(trust_list_one))
+        .route(paths::TRUST_LIST_ENTRIES, post(upsert_trust_entry))
+        .route(paths::MASTER_LIST, get(master_list))
+        .route(paths::MASTER_LIST_WITNESSES, post(set_witnesses))
+        .route(paths::MASTER_LIST_ENTRIES, post(upsert_master_entry))
+        .route(
+            paths::REVOCATIONS,
+            get(revocations).post(declare_revocation),
+        )
+        .route(paths::OPERATOR, get(operator_view))
+        .route(paths::EVIDENCE, get(evidence_catalogue))
+        .route(paths::EVIDENCE_ONE, get(evidence_release))
+        .route(paths::ADMIN_LOG, get(admin_log))
+        .route(paths::ADMIN_EVIDENCE, post(register_evidence))
+        .route(paths::NODES, post(register_node))
+        .route(paths::EDGES, post(add_edge))
+        .route(paths::CONTRACT_YAML, get(openapi_yaml))
         .with_state(app)
 }
 
@@ -1568,5 +1931,203 @@ impl TestServer {
         if let Some(join) = self.join.take() {
             let _ = join.await;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract gates
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contract_gates {
+    use super::*;
+    use crate::httpc::{request, Url};
+    use std::time::Duration;
+
+    /// The contract paths with their documented methods.
+    fn documented() -> std::collections::BTreeMap<String, Vec<String>> {
+        let doc: Value = serde_yaml::from_str(&contract_yaml()).expect("contract parses");
+        doc["paths"]
+            .as_object()
+            .expect("paths object")
+            .iter()
+            .map(|(path, item)| {
+                let methods = VERBS
+                    .iter()
+                    .filter(|v| item.get(*v).is_some())
+                    .map(|v| v.to_string())
+                    .collect();
+                (path.clone(), methods)
+            })
+            .collect()
+    }
+
+    const VERBS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
+
+    /// The routed paths, from the constants the router routes by
+    /// (the contract route itself carries no operation). This service
+    /// routes no tail-wildcard paths, so a constant is also the path's
+    /// key in the document.
+    fn routed() -> Vec<&'static str> {
+        [
+            paths::ROOT,
+            paths::HEALTHZ,
+            paths::KEYRING,
+            paths::GRAPH,
+            paths::ANCHOR_BUNDLE,
+            paths::TRUST_LISTS,
+            paths::TRUST_LIST_ONE,
+            paths::TRUST_LIST_ENTRIES,
+            paths::MASTER_LIST,
+            paths::MASTER_LIST_WITNESSES,
+            paths::MASTER_LIST_ENTRIES,
+            paths::REVOCATIONS,
+            paths::OPERATOR,
+            paths::EVIDENCE,
+            paths::EVIDENCE_ONE,
+            paths::ADMIN_LOG,
+            paths::ADMIN_EVIDENCE,
+            paths::NODES,
+            paths::EDGES,
+        ]
+        .to_vec()
+    }
+
+    /// A concrete probe path: every template parameter is replaced
+    /// with a value the handlers parse.
+    fn probe(path: &str) -> String {
+        path.replace("{jur}", "PROBE")
+            .replace("{node}", "PROBE")
+            .replace("{id}", "PROBE")
+    }
+
+    #[test]
+    fn the_golden_matches_the_committed_contract() {
+        assert_eq!(contract_yaml(), include_str!("../openapi.yaml"));
+    }
+
+    #[test]
+    #[ignore = "regenerates openapi.yaml after a route change: cargo test -- --ignored export"]
+    fn export_golden() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"),
+            contract_yaml(),
+        )
+        .expect("golden written");
+    }
+
+    #[test]
+    fn every_routed_path_is_documented() {
+        let doc = documented();
+        for path in routed() {
+            assert!(doc.contains_key(path), "routed but undocumented: {path}");
+        }
+    }
+
+    #[test]
+    fn every_documented_path_is_routed() {
+        let routed: Vec<String> = routed().iter().map(|p| p.to_string()).collect();
+        for path in documented().keys() {
+            assert!(routed.contains(path), "documented but not routed: {path}");
+        }
+    }
+
+    #[test]
+    fn routes_are_declared_by_constant_not_literal() {
+        let src = include_str!("api.rs");
+        assert_eq!(
+            src.matches(".route(\"").count(),
+            0,
+            "route paths come from the paths:: constants"
+        );
+    }
+
+    /// The `VERB /path` endpoint references embedded in the discovery
+    /// document must all be contracted operations.
+    #[test]
+    fn discovery_names_only_contracted_endpoints() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let doc = rt.block_on(async {
+            let ts = TestServer::spawn(Config::default())
+                .await
+                .expect("test server");
+            let resp = request(
+                "GET",
+                &Url::parse(&format!("{}/", ts.base_url)).expect("discovery url"),
+                &[],
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("discovery answered");
+            ts.stop().await;
+            resp.body_string()
+        });
+        let documented: Vec<String> = documented().into_keys().collect();
+        for verb in VERBS.map(str::to_uppercase) {
+            let mut rest = doc.as_str();
+            while let Some(pos) = rest.find(&verb) {
+                let after = &rest[pos + verb.len()..];
+                rest = after;
+                let Some(path) = after.strip_prefix(" /") else {
+                    continue;
+                };
+                let taken: String = path
+                    .chars()
+                    .take_while(|c| !matches!(c, ' ' | '"' | '<'))
+                    .collect();
+                let path = taken.split('?').next().unwrap_or("").to_string();
+                if path.is_empty() {
+                    continue;
+                }
+                assert!(
+                    documented.contains(&format!("/{path}")),
+                    "discovery names `{verb} /{path}` — no such operation in the contract"
+                );
+            }
+        }
+    }
+
+    /// The behavioral half: every documented operation answers
+    /// anything but 405, and every undocumented method on a documented
+    /// path answers 405 — on the live router.
+    #[tokio::test]
+    async fn the_router_serves_the_contract_exactly() {
+        let ts = TestServer::spawn(Config::default())
+            .await
+            .expect("test server");
+        for (path, methods) in documented() {
+            let concrete = probe(&path);
+            for verb in VERBS {
+                let resp = request(
+                    &verb.to_uppercase(),
+                    &Url::parse(&format!("{}{concrete}", ts.base_url)).expect("probe url"),
+                    &[],
+                    if verb == "get" {
+                        None
+                    } else {
+                        Some(b"{}".as_slice())
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("probe answered");
+                if methods.contains(&verb.to_string()) {
+                    assert_ne!(
+                        resp.status, 405,
+                        "{verb} {concrete}: the contract says routed, the router says otherwise"
+                    );
+                } else {
+                    assert_eq!(
+                        resp.status, 405,
+                        "{verb} {concrete}: served but not in the contract"
+                    );
+                }
+            }
+        }
+        ts.stop().await;
     }
 }

@@ -1,0 +1,561 @@
+components: {}
+info:
+  description: 'UniDPP trust-list service: jurisdiction trust lists per framework, the M-of-K multi-witness master list, and live reason-to-retroactivity revocations. Every response is as-of stamped and co-signed by the service keyring in the tree-head domain (Ed25519 and ECDSA P-256 over the exact body bytes), so a verifier checks the operator''s signed statement of state before it trusts the state. Seed fixtures derived from unidpp-signatif''s test trust graph make the service useful to a verifier out of the box. Read operations are public; mutations and the audit log require `Authorization: Bearer <UNIDPP_TRUST_ADMIN_TOKEN>` where a token is configured.'
+  license:
+    identifier: Apache-2.0
+    name: Apache-2.0
+  title: UniDPP trust
+  version: 0.1.0
+  x-unidpp-env-keys:
+  - UNIDPP_TRUST_BIND
+  - UNIDPP_TRUST_ADMIN_TOKEN
+  - UNIDPP_TRUST_STATE_FILE
+  - UNIDPP_TRUST_NO_SEED_FIXTURES
+  - UNIDPP_TRUST_DEV_SEED
+  - UNIDPP_TRUST_SIGN_SEED
+  - UNIDPP_TRUST_SIGN_SEED_P256
+openapi: 3.1.0
+paths:
+  /:
+    get:
+      operationId: discovery
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The discovery document: the service identity, the signing posture (the tree-head domain, both suites, the signature headers), the endpoint table, the revocation semantics, the as-of conventions, the seed-fixture provenance and the authentication rule'
+      summary: Serve the discovery document.
+      tags:
+      - trust
+  /admin/evidence:
+    post:
+      operationId: register_evidence
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: '`{{"id": ..., "requiredScope": ..., "contentHex": ...}}` — the bytes hex-encoded; optional `contentType` (default `application/octet-stream`) and `description`. Ungated registration is refused, and re-registration of an identifier is a conflict because supersession of evidence is a new identifier, not an edit'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The document is registered; its catalogue metadata and the audit sequence number are stated
+        '400':
+          description: Invalid JSON, a missing `id`, `requiredScope` or `contentHex`, or a `contentHex` that does not decode
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '409':
+          description: An evidence document with this identifier is already registered
+      summary: |-
+        POST /admin/evidence — register a gated evidence document: id,
+        contentType, description, requiredScope, contentHex (hex-encoded
+        bytes; the journal stores the same encoding, so replay is exact).
+        Register a gated evidence document.
+      tags:
+      - admin
+  /admin/log:
+    get:
+      operationId: admin_log
+      parameters:
+      - description: Records to return (default 100, maximum 10 000)
+        in: query
+        name: limit
+        required: false
+        schema:
+          format: int64
+          minimum: 0
+          type: integer
+      - description: Records to skip (default 0)
+        in: query
+        name: offset
+        required: false
+        schema:
+          format: int64
+          minimum: 0
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The audit-log window: the total record count, the offset and the records'
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Serve the append-only audit log.
+      tags:
+      - admin
+  /anchor-bundle:
+    get:
+      operationId: anchor_bundle
+      parameters:
+      - description: The jurisdiction whose trust list the bundle carries beside the master list
+        in: query
+        name: jurisdiction
+        required: true
+        schema:
+          type: string
+      - description: An RFC 3339 instant; the bundle is rendered as of that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The verifier-shaped anchor bundle: the jurisdiction''s trust list and the M-of-K master list, with wire-form keys a verifier rebuilds without touching the asymmetric PublicKey serde'
+        '400':
+          description: The `jurisdiction` parameter is absent, or the `at` parameter is present and is not a valid RFC 3339 instant
+        '404':
+          description: No trust list exists for the requested jurisdiction
+      summary: Serve the verifier artifact for one jurisdiction.
+      tags:
+      - trust
+  /edges:
+    post:
+      operationId: add_edge
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The parent-signed delegation credential document: `parent`, `child`, the signature slots and the delegated scope'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The credential is added; the stored credential and the audit sequence number are stated
+        '400':
+          description: Invalid JSON, or a credential the graph rejects (an unknown endpoint, an invalid signature or a scope violation)
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Add a delegation credential to the trust graph.
+      tags:
+      - admin
+  /evidence:
+    get:
+      operationId: evidence_catalogue
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The catalogue metadata only: identifiers, content types, descriptions, required scopes and sizes; document content never appears in the catalogue'
+      summary: |-
+        GET /evidence — the public catalogue: metadata only (ids, content
+        types, required scopes, sizes). Content never appears here; a
+        document is released only under its scope.
+        Serve the gated-evidence catalogue.
+      tags:
+      - trust
+  /evidence/{id}:
+    get:
+      operationId: evidence_release
+      parameters:
+      - description: The evidence identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: The requester's scope; the `X-UniDPP-Scope` header is accepted when the parameter is absent, and the parameter outranks the header
+        in: query
+        name: scope
+        required: false
+        schema:
+          type: string
+      - description: The requester identity the journal records; the `X-UniDPP-Requester` header is accepted when the parameter is absent
+        in: query
+        name: requester
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/octet-stream:
+              schema: {}
+          description: The document bytes are released and the signature covers the exact bytes returned; the response carries the registered content type and the required scope, and the release is journaled
+        '403':
+          description: The presented scope does not satisfy the registration; the refusal is a stated error naming the required scope, and no release is journaled
+        '404':
+          description: No evidence document with this identifier is registered
+      summary: |-
+        GET /evidence/{id}?scope=... — release a gated evidence document
+        (TODO.impl 224): the MobileQR `getbase64str` pattern with the
+        honesty doctrine applied. The scope arrives as the `scope` query
+        parameter or the `X-UniDPP-Scope` header (the parameter outranks
+        the header); the requester, when presented, as `requester` or
+        `X-UniDPP-Requester`. A scope that does not satisfy the
+        registration is a **stated 403 naming the required scope** — never
+        a silent 404; a release journals the access decision and the
+        response is signed over the exact bytes returned (integrity is the
+        signature, not a digest field).
+        Release a gated evidence document under its scope.
+      tags:
+      - trust
+  /graph:
+    get:
+      operationId: graph
+      parameters:
+      - description: An RFC 3339 instant; the graph is rendered as of that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The trust graph: the node count, the edge count, the nodes and the delegation edges, stamped with the as-of instant; a verifier reconstructs the signatif objects from this document'
+        '400':
+          description: The `at` parameter is present and is not a valid RFC 3339 instant
+      summary: Serve the full trust graph.
+      tags:
+      - trust
+  /healthz:
+    get:
+      operationId: healthz
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The service is serving; the signed status names the service and carries the as-of instant
+      summary: Liveness probe.
+      tags:
+      - trust
+  /keyring:
+    get:
+      operationId: keyring
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The public keyring: the keyring mode, the per-role suites, key ids and hex-encoded public anchors a verifier pins (the CLI `--anchor`), the signing domain and the verification recipe matching the response headers'
+      summary: Serve the public keyring.
+      tags:
+      - trust
+  /master-list:
+    get:
+      operationId: master_list
+      parameters:
+      - description: An RFC 3339 instant; attestations are verified against the witness set as of that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The master list: the M-of-K shape, the witness list, and every entry with its attestations, the live per-attestation verification results, the verified-witness count and the quorum verdict'
+        '400':
+          description: The `at` parameter is present and is not a valid RFC 3339 instant
+      summary: Serve the M-of-K master list.
+      tags:
+      - trust
+  /master-list/entries:
+    post:
+      operationId: upsert_master_entry
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The entry: `node` and `attestations` (witness, instant, signature slot); every attestation must name a witness that is already registered'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The entry is upserted; the node, the attestations and the audit sequence number are stated
+        '400':
+          description: Invalid JSON, an invalid entry, or an attestation naming an unregistered witness
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Upsert one master-list entry.
+      tags:
+      - admin
+  /master-list/witnesses:
+    post:
+      operationId: set_witnesses
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: '`{{"m": <threshold>, "witnesses": [...]}}` — the M-of-K shape is replaced wholesale by the stated threshold and witness keys'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The witness set is replaced; the new M-of-K shape with the rendered witnesses and the audit sequence number are stated
+        '400':
+          description: Invalid JSON, a missing `m` or `witnesses`, or an `m` that exceeds the witness count
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Replace the witness set of the master list.
+      tags:
+      - admin
+  /nodes:
+    post:
+      operationId: register_node
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The node document: `id` and `kind` (root, threshold-group, delegated or end); optional `keys`, which are merged into any existing registration of the same node'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The node is registered; the stored node and the audit sequence number are stated
+        '400':
+          description: Invalid JSON or an invalid node document
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Register a trust-graph node.
+      tags:
+      - admin
+  /operators/{node}:
+    get:
+      operationId: operator_view
+      parameters:
+      - description: The operator's node id
+        in: path
+        name: node
+        required: true
+        schema:
+          type: string
+      - description: An RFC 3339 instant; memberships are read for force at that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The operator''s credential directory: identity (kind, registered keys), delegation position (edges in and out with their scopes), trust-list memberships with their validity windows, master-list attestations and revocation standing'
+        '400':
+          description: The node id is not a valid operator node id, or the `at` parameter is present and is not a valid RFC 3339 instant
+        '404':
+          description: No operator with this node id is known here
+      summary: |-
+        GET /operators/{node}?at= — the operator surface (TODO.impl 224):
+        one operator's credential directory rendered from the same
+        registries (MobileQR's firm page + credential 有效期 counterpart):
+        identity (kind, registered keys), delegation position (edges in
+        and out with their scopes), trust-list memberships **with their
+        validity windows** (`not_before` / `superseded_at`), master-list
+        attestations, and revocation standing. An unknown operator is a
+        stated 404.
+        Serve the operator surface for one node.
+      tags:
+      - trust
+  /revocations:
+    get:
+      operationId: revocations
+      parameters:
+      - description: An RFC 3339 instant; each declaration is read for void-ab-initio standing at that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      - description: An RFC 3339 evidentiary cutoff; declarations made after it keep prior as-of verifications valid
+        in: query
+        name: known_by
+        required: false
+        schema:
+          type: string
+      - description: A distrust window `START..END` (or `START,END`); declarations whose window overlaps it are returned
+        in: query
+        name: window
+        required: false
+        schema:
+          type: string
+      - description: Restrict the response to declarations naming this subject (prefix match)
+        in: query
+        name: subject
+        required: false
+        schema:
+          type: string
+      - description: '`true` restricts to retroactive reasons, `false` to prospective reasons'
+        in: query
+        name: retroactive
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The declarations with the live reading: `known_at_cutoff`, `voids_at_as_of`, `standing_at_as_of`, the quorum verdict for retroactive declarations and the governing rule'
+        '400':
+          description: The `at`, `known_by` or `window` parameter does not parse, or `retroactive` is not a boolean
+      summary: Serve the revocation ledger with the live retroactivity reading.
+      tags:
+      - trust
+    post:
+      operationId: declare_revocation
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The declaration: `subject`, `reason`, `declared_at` (RFC 3339), `declared_by` and `window`; a retroactive reason additionally requires a quorate attestation (member-key slots, or a threshold-ceremony group signature pinned on the quorum node — see `quorum`)'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The declaration is recorded; the subject, the reason, the window and the audit sequence number are stated
+        '400':
+          description: Invalid JSON or an invalid declaration document
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '422':
+          description: 'The declaration is refused on the merits: a retroactive reason without a quorum attestation, or an attestation that does not reach the threshold'
+      summary: Declare a revocation.
+      tags:
+      - admin
+  /trust-lists:
+    get:
+      operationId: trust_lists
+      parameters:
+      - description: An RFC 3339 instant; every entry carries `in_force_at_as_of` for that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      - description: Restrict the response to one jurisdiction
+        in: query
+        name: jurisdiction
+        required: false
+        schema:
+          type: string
+      - description: Restrict the response to the lists whose framework matches this value
+        in: query
+        name: framework
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The trust lists, each with its jurisdiction, framework and entries with their validity windows, sorted by jurisdiction
+        '400':
+          description: The `at` parameter is present and is not a valid RFC 3339 instant
+      summary: Serve the jurisdiction trust lists.
+      tags:
+      - trust
+    post:
+      operationId: register_trust_list
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: '`{{"jurisdiction": ...}}`; optional `framework` and an initial `entries` array, which is applied after the list is registered'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The list is registered; the jurisdiction, the framework and the audit sequence number are stated
+        '400':
+          description: Invalid JSON, a missing or invalid `jurisdiction`, or an invalid entry in `entries`
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '409':
+          description: A trust list for this jurisdiction is already registered
+      summary: Register a jurisdiction trust list.
+      tags:
+      - admin
+  /trust-lists/{jur}:
+    get:
+      operationId: trust_list_one
+      parameters:
+      - description: The jurisdiction (matched case-insensitively)
+        in: path
+        name: jur
+        required: true
+        schema:
+          type: string
+      - description: An RFC 3339 instant; every entry carries `in_force_at_as_of` for that instant (alias `asof`)
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The jurisdiction''s trust list: jurisdiction, framework and the entries with their validity windows'
+        '400':
+          description: The `at` parameter is present and is not a valid RFC 3339 instant
+        '404':
+          description: No trust list exists for the requested jurisdiction
+      summary: Serve one jurisdiction's trust list.
+      tags:
+      - trust
+  /trust-lists/{jur}/entries:
+    post:
+      operationId: upsert_trust_entry
+      parameters:
+      - description: The jurisdiction (matched case-insensitively)
+        in: path
+        name: jur
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The entry: `node` and `not_before` (RFC 3339); optional `superseded_at`, an RFC 3339 instant whose presence is the withdrawal of the entry'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: The entry is upserted; the jurisdiction, the node, the validity window and the audit sequence number are stated
+        '400':
+          description: Invalid JSON or an invalid entry document
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '404':
+          description: No trust list exists for this jurisdiction
+      summary: Upsert one entry of a jurisdiction trust list.
+      tags:
+      - admin
+tags:
+- description: 'The public surface: discovery, health, keyring, graph, anchor bundle, trust lists, master list, revocations, operators, evidence'
+  name: trust
+- description: 'The operator surface: node, edge, trust-list, master-list and revocation mutations, evidence registration, the audit log'
+  name: admin

@@ -61,6 +61,7 @@
 
 pub mod api;
 pub mod hex;
+pub mod httpc;
 pub mod keyring;
 pub mod quorum;
 pub mod seed;
