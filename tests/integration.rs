@@ -1158,7 +1158,9 @@ async fn evidence_is_released_under_scope_and_the_access_is_journaled() {
     // Re-registration conflicts: supersession of evidence is a new id,
     // never an edit.
     assert_eq!(
-        post(base, "/admin/evidence", &body, Some("s3cret")).await.status,
+        post(base, "/admin/evidence", &body, Some("s3cret"))
+            .await
+            .status,
         409
     );
     // Unguarded registration is refused like every mutation.
@@ -1178,12 +1180,16 @@ async fn evidence_is_released_under_scope_and_the_access_is_journaled() {
     // document).
     let resp = get(&format!("{base}/evidence/ev-ccc-cert")).await;
     assert_eq!(resp.status, 403);
-    assert!(resp.body_string().contains("requires scope `market-surveillance`"));
+    assert!(resp
+        .body_string()
+        .contains("requires scope `market-surveillance`"));
 
     // The wrong scope states the refusal the same way.
     let resp = get(&format!("{base}/evidence/ev-ccc-cert?scope=consumer")).await;
     assert_eq!(resp.status, 403);
-    assert!(resp.body_string().contains("the request carried `consumer`"));
+    assert!(resp
+        .body_string()
+        .contains("the request carried `consumer`"));
 
     // Unknown id: stated 404.
     let resp = get(&format!("{base}/evidence/ev-unknown")).await;
@@ -1201,14 +1207,20 @@ async fn evidence_is_released_under_scope_and_the_access_is_journaled() {
     assert_eq!(resp.body, pdf);
     assert!(resp.header("x-sig-ed25519").is_some());
     assert!(resp.header("x-sig-ecdsa-p256").is_some());
-    assert_eq!(resp.header("x-unidpp-scope").unwrap(), "market-surveillance");
+    assert_eq!(
+        resp.header("x-unidpp-scope").unwrap(),
+        "market-surveillance"
+    );
 
     // The header form serves the same gate (X-UniDPP-Scope).
     let url = support::Url::parse(&format!("{base}/evidence/ev-ccc-cert")).unwrap();
     let resp = support::request(
         "GET",
         &url,
-        &[("x-unidpp-scope".to_string(), "market-surveillance".to_string())],
+        &[(
+            "x-unidpp-scope".to_string(),
+            "market-surveillance".to_string(),
+        )],
         None,
         std::time::Duration::from_secs(5),
     )
@@ -1276,7 +1288,9 @@ async fn an_operator_renders_its_credential_directory_with_validity() {
     // An unknown operator is a stated 404.
     let resp = get(&format!("{base}/operators/{}", enc("no-such-operator"))).await;
     assert_eq!(resp.status, 404);
-    assert!(resp.body_string().contains("no operator `no-such-operator`"));
+    assert!(resp
+        .body_string()
+        .contains("no operator `no-such-operator`"));
 
     // A malformed node id is a stated 400.
     let resp = get(&format!("{base}/operators/{}", enc("not a node id!"))).await;

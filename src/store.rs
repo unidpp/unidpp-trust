@@ -347,9 +347,7 @@ impl AuditRecord {
                 Op::DeclareRevocation { revocation }
             }
             "register-evidence" => {
-                let b = body
-                    .as_object()
-                    .ok_or("`body` not an object")?;
+                let b = body.as_object().ok_or("`body` not an object")?;
                 let id = b
                     .get("id")
                     .and_then(Value::as_str)
@@ -386,9 +384,7 @@ impl AuditRecord {
                 }
             }
             "evidence-released" => {
-                let b = body
-                    .as_object()
-                    .ok_or("`body` not an object")?;
+                let b = body.as_object().ok_or("`body` not an object")?;
                 Op::EvidenceReleased {
                     id: b
                         .get("id")
@@ -806,7 +802,9 @@ impl Store {
             ));
         }
         if evidence.content.is_empty() {
-            return Err(StoreError::Invalid("`content_hex` must not be empty".into()));
+            return Err(StoreError::Invalid(
+                "`content_hex` must not be empty".into(),
+            ));
         }
         Ok(self.record(Op::RegisterEvidence { evidence }))
     }
@@ -1070,7 +1068,11 @@ mod tests {
                 })
                 .unwrap();
             store
-                .release_evidence("ev-ccc-cert", Some("customs-de".into()), "market-surveillance")
+                .release_evidence(
+                    "ev-ccc-cert",
+                    Some("customs-de".into()),
+                    "market-surveillance",
+                )
                 .unwrap();
             // The refusal creates no record (a denial an attacker could
             // flood is not audit content).
