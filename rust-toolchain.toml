@@ -1,0 +1,7 @@
+[toolchain]
+# The operator's local Rust generation. The workflows install no
+# toolchain of their own; rustup reads this file at every cargo
+# invocation, so CI formats with the same rustfmt the commits were
+# written under (the cross-generation drift class the 251 pass met).
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
